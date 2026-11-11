@@ -4056,6 +4056,110 @@ err:
     return -1;
 }
 
+/*
+ * An A18 Pro has one of two encoders, and the ADT describes the one this part has: ave
+ * (encoder 0, 0x285100000) or ave1 (encoder 1, 0x289100000, on the J700 measured). The
+ * DT describes both, disabled. Match the DT node to the ADT node at its address.
+ */
+static const char *dt_t8140_ave_adt_path(int node)
+{
+    static const char *const paths[] = {"/arm-io/ave", "/arm-io/ave0", "/arm-io/ave1"};
+    const fdt32_t *reg;
+    int len;
+
+    reg = fdt_getprop(dt, node, "reg", &len);
+    /* The SoC bus maps one-to-one ("ranges;"), with two address cells. */
+    if (!reg || len < 2 * (int)sizeof(*reg))
+        return NULL;
+    u64 dt_address = ((u64)fdt32_to_cpu(reg[0]) << 32) | fdt32_to_cpu(reg[1]);
+
+    for (size_t i = 0; i < ARRAY_SIZE(paths); i++) {
+        int adt_path[8] = {0};
+        u64 adt_address;
+
+        if (adt_path_offset_trace(adt, paths[i], adt_path) < 0)
+            continue;
+        if (adt_get_reg(adt, adt_path, "reg", 0, &adt_address, NULL) < 0)
+            continue;
+        if (adt_address == dt_address)
+            return paths[i];
+    }
+    return NULL;
+}
+
+static bool dt_ave_node_disabled(int node)
+{
+    int len;
+    const char *status = fdt_getprop(dt, node, "status", &len);
+
+    return status &&
+           !((len == 5 && !memcmp(status, "okay", 5)) || (len == 3 && !memcmp(status, "ok", 3)));
+}
+
+/* Enable a node and, first, the power-domain providers it names, a few levels up. */
+static int dt_ave_enable_phandle(u32 phandle, int depth)
+{
+    u32 providers[8];
+    size_t count = 0;
+    int node, len;
+
+    node = fdt_node_offset_by_phandle(dt, phandle);
+    if (node < 0 || depth > 6)
+        return -1;
+
+    const fdt32_t *pd = fdt_getprop(dt, node, "power-domains", &len);
+    for (int i = 0; pd && i < len / (int)sizeof(*pd);) {
+        u32 ph = fdt32_to_cpu(pd[i]);
+        int provider = fdt_node_offset_by_phandle(dt, ph);
+        if (provider < 0 || count == ARRAY_SIZE(providers))
+            return -1;
+        const fdt32_t *cells = fdt_getprop(dt, provider, "#power-domain-cells", NULL);
+        providers[count++] = ph;
+        i += 1 + (cells ? fdt32_to_cpu(*cells) : 0);
+    }
+    for (size_t i = 0; i < count; i++)
+        if (dt_ave_enable_phandle(providers[i], depth + 1))
+            return -1;
+
+    node = fdt_node_offset_by_phandle(dt, phandle);
+    if (node < 0)
+        return -1;
+    if (dt_ave_node_disabled(node) && fdt_setprop_string(dt, node, "status", "okay"))
+        return -1;
+    return 0;
+}
+
+/* The encoder, its DARTs and the power states of both. */
+static int dt_t8140_ave_enable(const char *path)
+{
+    u32 refs[8];
+    size_t count = 0;
+    int node, len;
+
+    node = fdt_path_offset(dt, path);
+    if (node < 0)
+        return -1;
+    const fdt32_t *iommus = fdt_getprop(dt, node, "iommus", &len);
+    for (int i = 0; iommus && i + 1 < len / (int)sizeof(*iommus); i += 2) {
+        u32 ph = fdt32_to_cpu(iommus[i]);
+        bool seen = false;
+
+        for (size_t j = 0; j < count; j++)
+            seen |= refs[j] == ph;
+        if (!seen && count < ARRAY_SIZE(refs))
+            refs[count++] = ph;
+    }
+    for (size_t i = 0; i < count; i++)
+        if (dt_ave_enable_phandle(refs[i], 0))
+            return -1;
+
+    node = fdt_path_offset(dt, path);
+    u32 self = node < 0 ? 0 : fdt_get_phandle(dt, node);
+    if (!self)
+        return -1;
+    return dt_ave_enable_phandle(self, 0);
+}
+
 static int dt_set_ave_node(int node)
 {
     char path[64];
@@ -4063,11 +4167,18 @@ static int dt_set_ave_node(int node)
         bail("FDT: AVE node path too long\n");
 
     const char *reason = "invalid ADT firmware segments";
+    bool t8140 = !fdt_node_check_compatible(dt, node, "apple,t8140-ave");
     const char *adt_path = "/arm-io/ave";
-    int anode = adt_path_offset(adt, adt_path);
-    if (anode < 0) {
-        adt_path = "/arm-io/ave0";
+    int anode;
+    if (t8140) {
+        adt_path = dt_t8140_ave_adt_path(node);
+        anode = adt_path ? adt_path_offset(adt, adt_path) : -1;
+    } else {
         anode = adt_path_offset(adt, adt_path);
+        if (anode < 0) {
+            adt_path = "/arm-io/ave0";
+            anode = adt_path_offset(adt, adt_path);
+        }
     }
     if (anode < 0) {
         reason = "ADT node absent";
@@ -4186,22 +4297,44 @@ static int dt_set_ave_node(int node)
         reason = "ADT tunable handoff failed";
         goto disable;
     }
+    if (t8140) {
+        if (dt_t8140_ave_enable(path)) {
+            reason = "cannot enable it, its DARTs or its power states";
+            goto disable;
+        }
+        printf("FDT: AVE %s enabled from ADT %s\n", path, adt_path);
+    }
     return 0;
 
 disable:
     node = fdt_path_offset(dt, path);
     if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
         return -1;
-    printf("FDT: AVE disabled: %s\n", reason);
+    printf("FDT: AVE %s disabled: %s\n", path, reason);
     return 0;
 }
 
 static int dt_set_ave(void)
 {
     for (size_t i = 0; i < ARRAY_SIZE(ave_compatibles); i++) {
-        int node = fdt_node_offset_by_compatible(dt, -1, ave_compatibles[i]);
-        if (node >= 0)
-            return dt_set_ave_node(node);
+        char paths[2][64];
+        size_t count = 0;
+        int ret = 0;
+
+        /* Paths, not offsets: handing one encoder over moves the others. */
+        for (int node = fdt_node_offset_by_compatible(dt, -1, ave_compatibles[i]);
+             node >= 0 && count < ARRAY_SIZE(paths);
+             node = fdt_node_offset_by_compatible(dt, node, ave_compatibles[i]))
+            if (!fdt_get_path(dt, node, paths[count], sizeof(paths[count])))
+                count++;
+        if (!count)
+            continue;
+        for (size_t j = 0; j < count && !ret; j++) {
+            int node = fdt_path_offset(dt, paths[j]);
+            if (node >= 0)
+                ret = dt_set_ave_node(node);
+        }
+        return ret;
     }
     return 0;
 }
