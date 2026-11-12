@@ -3218,9 +3218,17 @@ static bool dcp6_dt_describes(void *dt)
  * iBoot leaves the DCP running and both of its DARTs locked on four-level roots. The kernel adopts
  * that session and resolves firmware DVAs through the live tables, so this publishes no
  * iommu-addresses: only what the ADT says, checked against the device tree and the registers.
- * The image is pinned because 27.0 and 27.0.1 report the same iBoot version.
+ * The image is pinned, not only the OS release: 27.0 and 27.0.1 report the same iBoot version. Each
+ * row is an OS release (by its iBoot string, which detect_firmware() does not know for the later
+ * ones) with the DCP image it ships; every row is driven through the kernel's 27.0 interface.
  */
-#define T6050_DCP_UUID  "64863924-B56B-3E32-87FE-038677F52709"
+static const struct {
+    const char *iboot, *uuid;
+} t6050_images[] = {
+    {"mBoot-20457.1.29", "64863924-B56B-3E32-87FE-038677F52709"},     /* 27.0 */
+    {"mBoot-20457.60.65.0.1", "58CB3FFC-B2BA-352E-B20B-71A91B15FA9F"}, /* 27.3 (26C5035r) */
+};
+#define T6050_PROFILE (&fw_versions[V27_0]) /* what apple,firmware-version and -compat say */
 #define T6050_NDISP     5       /* disp0 reg[0..4] are the dcp's disp-0..disp-4 */
 #define T6050_BW_BASE   0x20000 /* bandwidth agent 0's scratch in the PMC metadata */
 #define T6050_BW_STRIDE 0x4000
@@ -3241,6 +3249,7 @@ static struct {
     char path[T6050_N][T6050_PATH];
     u64 coproc, pmc, pmc_size, vram, vram_size;
     u32 bw_offset, nits, nclk, clk_id[T6050_CLOCKS], clk_hz[T6050_CLOCKS], pmc_ph;
+    const char *uuid; /* the matched row of t6050_images */
     const char *gamut;
 } t6050;
 
@@ -3296,10 +3305,13 @@ static T6050_INIT int t6050_check_adt(void)
     int disp0 = adt_path_offset(adt, "/arm-io/disp0");
     const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
 
-    if (os_firmware.version != V27_0)
-        bail("OS firmware %s is not 27.0\n", os_firmware.string);
-    if (!dcp6_is_uuid(uuid, len) || strcmp(uuid, T6050_DCP_UUID))
-        bail("DCP image %s is not " T6050_DCP_UUID "\n", dcp6_is_uuid(uuid, len) ? uuid : "(none)");
+    for (u32 i = 0; i < ARRAY_SIZE(t6050_images); i++)
+        if (dcp6_is_uuid(uuid, len) && !strcmp(os_firmware.iboot, t6050_images[i].iboot) &&
+            !strcmp(uuid, t6050_images[i].uuid))
+            t6050.uuid = t6050_images[i].uuid;
+    if (!t6050.uuid)
+        bail("OS firmware %s (%s) with DCP image %s is not a qualified pair\n", os_firmware.string,
+             os_firmware.iboot, dcp6_is_uuid(uuid, len) ? uuid : "(none)");
     if (dcp6_adt_u32(nub, "running", &val) || val != 1 || disp0 < 0 ||
         adt_getprop(adt, disp0, "external", NULL))
         bail("the DCP is not running an internal panel\n");
@@ -3474,10 +3486,10 @@ static T6050_TEXT int t6050_publish(void *dt)
     int nlen = 0;
 
     if (firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]),
-                         "apple,firmware-version", &os_firmware) ||
+                         "apple,firmware-version", T6050_PROFILE) ||
         firmware_set_fdt(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DCP]),
-                         "apple,firmware-compat", &os_firmware) ||
-        t6050_setprop(dt, T6050_DCP, "apple,firmware-uuid", T6050_DCP_UUID, sizeof(T6050_DCP_UUID)))
+                         "apple,firmware-compat", T6050_PROFILE) ||
+        t6050_setprop(dt, T6050_DCP, "apple,firmware-uuid", t6050.uuid, strlen(t6050.uuid) + 1))
         return -1;
 
     /* The bandwidth scratch, in the PMC metadata (disp0 reg[4]), as register window 5 */
@@ -3557,7 +3569,7 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
     snprintf(a, sizeof(a), "/arm-io/dcpext%d/iop-dcpext%d-nub", n, n);
     int nub = adt_path_offset(adt, a);
     const char *uuid = nub < 0 ? NULL : adt_getprop(adt, nub, "uuid", &len);
-    if (!dcp6_is_uuid(uuid, len) || strcmp(uuid, T6050_DCP_UUID) ||
+    if (!dcp6_is_uuid(uuid, len) || strcmp(uuid, t6050.uuid) ||
         dcp6_adt_u32(nub, "running", &val) || val != 1)
         bail("dcpext%d: not running the pinned image\n", n);
     snprintf(a, sizeof(a), "/arm-io/dcpext%d", n);
@@ -3653,11 +3665,11 @@ static T6050_TEXT int t6050_ext_one(void *dt, int n)
         if (fdt_get_path(dt, targets[i], path[i], T6050_PATH))
             return -1;
     if (firmware_set_fdt(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-version",
-                         &os_firmware) ||
+                         T6050_PROFILE) ||
         firmware_set_fdt(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-compat",
-                         &os_firmware) ||
-        fdt_setprop(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-uuid", T6050_DCP_UUID,
-                    sizeof(T6050_DCP_UUID)) ||
+                         T6050_PROFILE) ||
+        fdt_setprop(dt, kboot_fdt_path_exact(dt, path[0]), "apple,firmware-uuid", t6050.uuid,
+                    strlen(t6050.uuid) + 1) ||
         fdt_setprop(dt, kboot_fdt_path_exact(dt, path[0]), "apple,bw-scratch", v, sizeof(v)))
         return -1;
     if (output && fdt_appendprop(dt, kboot_fdt_path_exact(dt, t6050.path[T6050_DISP]), "iommus",
