@@ -43,7 +43,8 @@
  * brightness moves; the first call of a tag records every word that is not zero.
  */
 #define S2R_BIG_MIN   0x200UL
-#define S2R_BIG_WORDS 1536
+#define S2R_HIST_MIN  0x1000UL /* swap_submit; a color table (0x600) is not kept */
+#define S2R_BIG_WORDS S2R_HIST_WORDS
 #define S2R_BIG_SLOTS 6
 #define S2R_BIG_NOSLOT 15
 #define S2R_BIG_FROM  ALIGN_UP(12 + S2R_PKT_MAX, 8)
@@ -69,6 +70,7 @@ struct s2r_big {
 };
 /* From the heap: the image has no .bss room before the DCP __OS_LOG buffer that sits behind it. */
 static struct s2r_big *s2r_big[S2R_DCP_N];
+struct s2r_hist *sptm_virt_s2r_hist[S2R_DCP_N];
 static u8 s2r_nbig[S2R_DCP_N];
 static int s2r_n_dcp;
 u32 sptm_virt_s2r_dcp_pkt; /* host: copy the DCPs' IOMFB packets into the ring */
@@ -155,7 +157,7 @@ static int s2r_big_slot(int idx, u32 tag)
     return s2r_nbig[idx]++;
 }
 
-static void s2r_dcp_big(int idx, struct s2r_dcp *d, u64 off, u64 h0, u64 pa0, bool a2i)
+static void s2r_dcp_big(int idx, struct s2r_dcp *d, u64 off, u64 h0, u64 h1, u64 pa0, bool a2i)
 {
     u64 in = h0 >> 32, end = min(off + 12 + in, off + S2R_BIG_WORDS * 8UL);
     int slot = s2r_big_slot(idx, (u32)h0);
@@ -164,10 +166,21 @@ static void s2r_dcp_big(int idx, struct s2r_dcp *d, u64 off, u64 h0, u64 pa0, bo
     if (slot < 0)
         return;
     struct s2r_big *b = &s2r_big[idx][slot];
+    struct s2r_hist *hs = in >= S2R_HIST_MIN && 12 + in <= S2R_BIG_WORDS * 8UL ? sptm_virt_s2r_hist[idx] : NULL;
+    u64 *hw = NULL;
+    if (hs) {
+        hs->n++;
+        hs->call[(hs->n - 1) % S2R_HIST_N] = 0;
+        hw = hs->w[(hs->n - 1) % S2R_HIST_N];
+        hw[0] = h0;
+        hw[1] = h1;
+    }
     for (u64 o = off + S2R_BIG_FROM; o < end && o + 8 <= S2R_DCP_RPC; o += 8) {
         u64 v, w = (o - off) / 8, pa = s2r_dcp_pa(d, o);
         if (!pa || !sptm_virt_peek64(pa, &v))
             return;
+        if (hw)
+            hw[w] = v;
         if (v == b->prev[w])
             continue;
         b->prev[w] = v;
@@ -177,6 +190,8 @@ static void s2r_dcp_big(int idx, struct s2r_dcp *d, u64 off, u64 h0, u64 pa0, bo
         if (++b->churn[w] == S2R_BIG_CHURN)
             s2r_pkt_rec(idx, 6, slot << 12 | w, pa, S2R_BIG_CHURN, a2i);
     }
+    if (hs)
+        hs->call[(hs->n - 1) % S2R_HIST_N] = hs->n;
 }
 
 /* kind 0: an AP call, 1: a DCP callback, 2: an AP call's output, 3: a callback's output */
@@ -190,7 +205,7 @@ static void s2r_dcp_copy(int idx, struct s2r_dcp *d, u64 off, int kind, bool a2i
     u64 in = h0 >> 32, out = h1 & 0xffffffff;
     bool big = kind == 0 && in >= S2R_BIG_MIN;
     if (big)
-        s2r_dcp_big(idx, d, off, h0, pa0, a2i);
+        s2r_dcp_big(idx, d, off, h0, h1, pa0, a2i);
     u64 from = kind < 2 ? off + 16 : ALIGN_DOWN(off + 12 + min(in, (u64)S2R_DCP_RPC), 8);
     u64 outmax = kind == 2 && in >= S2R_BIG_MIN ? (u64)S2R_BIG_OUT : (u64)S2R_OUT_MAX;
     u64 to = kind < 2 ? off + 12 + min(in, big ? (u64)S2R_PKT_MAX : (u64)S2R_IN_MAX)
@@ -313,6 +328,7 @@ void s2r_dcp_add(const char *name, u64 mbox)
         return;
     s2r_dcp[s2r_n_dcp] = (struct s2r_dcp){.mbox = mbox, .dart = base, .dart_size = size};
     s2r_big[s2r_n_dcp] = calloc(S2R_BIG_SLOTS, sizeof(struct s2r_big));
+    sptm_virt_s2r_hist[s2r_n_dcp] = calloc(1, sizeof(struct s2r_hist));
     printf("SPTM-virt[s2r]: dcp-pkt %d %s mbox 0x%lx dart 0x%lx\n", s2r_n_dcp, name, mbox, base);
     s2r_n_dcp++;
 }

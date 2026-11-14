@@ -24,6 +24,11 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 
 extern u32 sptm_virt_s2r_dcp_pkt;
+struct hist { /* src/s2r_dcp_pkt.h: struct s2r_hist */
+    u64 n, call[3];
+    u64 w[3][1536];
+};
+extern struct hist *sptm_virt_s2r_hist[];
 void s2r_dcp_add(const char *name, u64 mbox);
 void s2r_dcp_watch(u64 addr, const u64 *val, int width);
 
@@ -324,6 +329,20 @@ int main(void)
     }
     CHECK(sent == 199, "word 100 recorded %d more times, want 199 (200 in all)", sent);
     CHECK(volatile_at == 199, "word 100 marked volatile at change %d, want 199", volatile_at);
+
+    /* The last three large calls are kept whole, volatile words too: 250 calls moved word 100 and
+     * the ring has stopped recording it, but the last three values are still readable. */
+    struct hist *h = sptm_virt_s2r_hist[0];
+    CHECK(h && h->n == 252, "history: %lu calls, want 252", h ? (unsigned long)h->n : 0UL);
+    for (int k = 0; h && k < 3; k++) {
+        int at = (252 - 2 + k - 1) % 3; /* call number c sits at (c - 1) % 3 */
+        CHECK(h->call[at] == 250 + k, "history: slot %d holds call %lu, want %d", at, (unsigned long)h->call[at], 250 + k);
+        CHECK(h->w[at][0] == ((0x1144UL << 32) | 0x38353441), "history: call %d head 0x%lx", 250 + k, (unsigned long)h->w[at][0]);
+        CHECK(h->w[at][100] == 0x9000 + 247 + k, "history: call %d word 100 is 0x%lx, want 0x%x", 250 + k,
+              (unsigned long)h->w[at][100], 0x9000 + 247 + k);
+        CHECK(h->w[at][2] == 0x5002 && h->w[at][553] == 0x5000 + 553, "history: call %d words 2 and 553: 0x%lx 0x%lx", 250 + k,
+              (unsigned long)h->w[at][2], (unsigned long)h->w[at][553]);
+    }
 
     /* A second large call (a color table) has its own baseline: neither call records the other's words. */
     *(u64 *)pg_pa(CALL_OFF) = (0x600UL << 32) | 0x3054554c; /* "LUT0" */

@@ -30,6 +30,10 @@ PKT_KINDS = {0: "AP-call", 1: "DCP-callback", 2: "AP-call-out", 3: "callback-out
              6: "big-volatile", 7: "resolve"}
 MARKER = 1 << 55
 WRITE = 1 << 50
+HIST_N = 3  # src/s2r_dcp_pkt.h: S2R_HIST_N
+HIST_WORDS = 1536  # S2R_HIST_WORDS
+HIST_DCPS = 5  # S2R_DCP_N in src/s2r_dcp_pkt.c
+HIST = struct.Struct(f"<{1 + HIST_N}Q{HIST_N * HIST_WORDS}Q")
 
 
 def decode(rec):
@@ -110,6 +114,35 @@ def parse_pa(text):
     return int(lo, 0), int(size, 0) if size else 1
 
 
+def hist_calls(raw):
+    """[(call number, packet bytes)] oldest first, from the bytes of struct s2r_hist (src/s2r_dcp_pkt.h).
+
+    A packet is its tag (4 bytes), the input size (4), the output size (4), then the input; one the copy
+    did not finish has call number 0 and is left out. The size is cut to the bytes the heap kept."""
+    n, *rest = HIST.unpack_from(raw)
+    calls, words = rest[:HIST_N], rest[HIST_N:]
+    out = []
+    for i, call in enumerate(calls):
+        if call == 0 or call > n:
+            continue
+        packet = struct.pack(f"<{HIST_WORDS}Q", *words[i * HIST_WORDS:(i + 1) * HIST_WORDS])
+        out.append((call, packet[:min(12 + struct.unpack_from("<I", packet, 4)[0], HIST_WORDS * 8)]))
+    return sorted(out)
+
+
+def write_hist(iface, p, sym, prefix):
+    """Read struct s2r_hist of every DCP from the heap and write each kept call as a .bin file."""
+    table = sym["sptm_virt_s2r_hist"]
+    for idx in range(HIST_DCPS):
+        ptr = p.read64(table + 8 * idx)
+        if not ptr:
+            continue
+        for call, data in hist_calls(iface.readmem(ptr, HIST.size)):
+            path = pathlib.Path(f"{prefix}-dcp{idx}-call{call}.bin")
+            path.write_bytes(data)
+            print(f"hist dcp{idx} call {call}: {len(data)} bytes, tag {data[:4].decode('latin1')!r} -> {path}", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--elf", type=pathlib.Path, default=pathlib.Path("build/aura-raw.elf"))
@@ -122,6 +155,9 @@ def main():
     ap.add_argument("--freq", type=int, default=24_000_000, help="CNTFRQ_EL0 (default 24 MHz)")
     ap.add_argument("--no-names", action="store_true", help="skip the ADT node lookup")
     ap.add_argument("--last", type=int, help="only the last N records in the ring")
+    ap.add_argument("--hist", type=pathlib.Path, metavar="PREFIX",
+                    help="also write the last three large calls (swap_submit) of each DCP whole, to PREFIX-dcp<N>-call<C>.bin")
+    ap.add_argument("--hist-only", action="store_true", help="with --hist: skip the ring")
     args = ap.parse_args()
 
     from run_guest_sptm import Symbols
@@ -132,6 +168,10 @@ def main():
     p = AuraProxy(iface, debug=False)
     bootstrap_port(iface, p)
     sym = Symbols(args.nm, args.elf, p.get_base())
+    if args.hist:
+        write_hist(iface, p, sym, args.hist)
+        if args.hist_only:
+            return
     lookup = None if args.no_names else ProxyUtils(p).adt.build_addr_lookup()
 
     ring = p.read64(sym["sptm_virt_s2r_ring"])
