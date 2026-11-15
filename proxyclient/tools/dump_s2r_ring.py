@@ -30,10 +30,11 @@ PKT_KINDS = {0: "AP-call", 1: "DCP-callback", 2: "AP-call-out", 3: "callback-out
              6: "big-volatile", 7: "resolve"}
 MARKER = 1 << 55
 WRITE = 1 << 50
-HIST_N = 3  # src/s2r_dcp_pkt.h: S2R_HIST_N
-HIST_WORDS = 1536  # S2R_HIST_WORDS
-HIST_DCPS = 5  # S2R_DCP_N in src/s2r_dcp_pkt.c
-HIST = struct.Struct(f"<{1 + HIST_N}Q{HIST_N * HIST_WORDS}Q")
+PKT_MAGIC = 0x0000315250523253  # "S2RPR1", src/s2r_dcp_pkt.h
+PKT_WORDS = 528  # S2R_PKT_WORDS: holds the 4216-byte swap_submit packet (12 + 0x106c)
+PKT_DCPS = 5  # S2R_DCP_N in src/s2r_dcp_pkt.c
+PKT_HDR = struct.Struct("<4Q")  # magic, n (total calls ever), nent (entries), entry_bytes
+PKT_ENTRY = struct.Struct(f"<2Q{PKT_WORDS}Q")  # call (0: unfinished), tick, the packet's words
 
 
 def decode(rec):
@@ -114,33 +115,68 @@ def parse_pa(text):
     return int(lo, 0), int(size, 0) if size else 1
 
 
-def hist_calls(raw):
-    """[(call number, packet bytes)] oldest first, from the bytes of struct s2r_hist (src/s2r_dcp_pkt.h).
+def ring_entries(raw):
+    """[(call, tick, packet words)] oldest first, from the bytes of struct s2r_pkt_ring (src/s2r_dcp_pkt.h).
 
-    A packet is its tag (4 bytes), the input size (4), the output size (4), then the input; one the copy
-    did not finish has call number 0 and is left out. The size is cut to the bytes the heap kept."""
-    n, *rest = HIST.unpack_from(raw)
-    calls, words = rest[:HIST_N], rest[HIST_N:]
+    An entry the copy did not finish has call number 0 and is left out."""
+    magic, n, nent, entry_bytes = PKT_HDR.unpack_from(raw)
+    if magic != PKT_MAGIC or entry_bytes != PKT_ENTRY.size:
+        raise SystemExit(f"packet ring: bad header (magic {magic:#x}, entry_bytes {entry_bytes})")
     out = []
-    for i, call in enumerate(calls):
-        if call == 0 or call > n:
-            continue
-        packet = struct.pack(f"<{HIST_WORDS}Q", *words[i * HIST_WORDS:(i + 1) * HIST_WORDS])
-        out.append((call, packet[:min(12 + struct.unpack_from("<I", packet, 4)[0], HIST_WORDS * 8)]))
+    for i in range(nent):
+        call, tick, *words = PKT_ENTRY.unpack_from(raw, PKT_HDR.size + i * entry_bytes)
+        if call:
+            out.append((call, tick, struct.pack(f"<{PKT_WORDS}Q", *words)))
     return sorted(out)
 
 
-def write_hist(iface, p, sym, prefix):
-    """Read struct s2r_hist of every DCP from the heap and write each kept call as a .bin file."""
+def pkt_bytes(entries):
+    """A .pkts file's bytes: per entry a 16-byte header (call, tick) then the 4224 packet bytes, oldest first."""
+    return b"".join(struct.pack("<2Q", call, tick) + data for call, tick, data in entries)
+
+
+def read_ring(iface, ptr):
+    """The whole ring of one DCP from the heap, in chunks."""
+    magic, n, nent, entry_bytes = PKT_HDR.unpack(iface.readmem(ptr, PKT_HDR.size))
+    raw = bytearray(iface.readmem(ptr, PKT_HDR.size))
+    per = max(1, (1 << 20) // entry_bytes)
+    for done in range(0, nent, per):
+        k = min(per, nent - done)
+        raw += iface.readmem(ptr + PKT_HDR.size + done * entry_bytes, k * entry_bytes)
+    return bytes(raw), n
+
+
+def write_pkts(iface, p, sym, prefix):
+    """Read the packet ring of every DCP from the heap and write each one's kept calls to PREFIX-dcp<N>.pkts."""
     table = sym["sptm_virt_s2r_hist"]
-    for idx in range(HIST_DCPS):
+    for idx in range(PKT_DCPS):
         ptr = p.read64(table + 8 * idx)
         if not ptr:
             continue
-        for call, data in hist_calls(iface.readmem(ptr, HIST.size)):
-            path = pathlib.Path(f"{prefix}-dcp{idx}-call{call}.bin")
-            path.write_bytes(data)
-            print(f"hist dcp{idx} call {call}: {len(data)} bytes, tag {data[:4].decode('latin1')!r} -> {path}", file=sys.stderr)
+        raw, n = read_ring(iface, ptr)
+        entries = ring_entries(raw)
+        if not entries:
+            print(f"pkts dcp{idx}: no finished call", file=sys.stderr)
+            continue
+        calls = [c for c, _, _ in entries]
+        path = pathlib.Path(f"{prefix}-dcp{idx}.pkts")
+        path.write_bytes(pkt_bytes(entries))
+        print(f"pkts dcp{idx}: {len(entries)} of {n} calls kept, calls {calls[0]}..{calls[-1]}, "
+              f"ticks {entries[0][1]}..{entries[-1][1]} -> {path}", file=sys.stderr)
+
+
+def selftest():
+    """The layout parser on a synthetic ring: two whole calls and one unfinished, oldest first."""
+    wire = b"194A" + struct.pack("<II", 0x106C, 8) + bytes((k % 251) for k in range(0x106C))
+    raw = struct.pack("<4Q", PKT_MAGIC, 2, 3, PKT_ENTRY.size)
+    raw += struct.pack("<2Q", 1, 240_000_000) + wire.ljust(PKT_WORDS * 8, b"\0")
+    raw += struct.pack("<2Q", 2, 264_000_000) + wire.ljust(PKT_WORDS * 8, b"\0")
+    raw += struct.pack("<2Q", 0, 0) + bytes(PKT_WORDS * 8)  # the copy did not finish
+    got = ring_entries(raw)
+    assert [c for c, _, _ in got] == [1, 2]
+    assert got[0][2][:12] == wire[:12] and got[0][2] == wire.ljust(PKT_WORDS * 8, b"\0")
+    assert pkt_bytes(got)[:24] == struct.pack("<2Q", 1, 240_000_000) + wire[:8]
+    print("selftest PASS: 2 calls of 3 kept, oldest first, packets whole")
 
 
 def main():
@@ -156,9 +192,13 @@ def main():
     ap.add_argument("--no-names", action="store_true", help="skip the ADT node lookup")
     ap.add_argument("--last", type=int, help="only the last N records in the ring")
     ap.add_argument("--hist", type=pathlib.Path, metavar="PREFIX",
-                    help="also write the last three large calls (swap_submit) of each DCP whole, to PREFIX-dcp<N>-call<C>.bin")
+                    help="write the packet ring (every large call, whole) of each DCP to PREFIX-dcp<N>.pkts")
     ap.add_argument("--hist-only", action="store_true", help="with --hist: skip the ring")
+    ap.add_argument("--selftest", action="store_true", help="run the packet-ring parser selftest and exit")
     args = ap.parse_args()
+    if args.selftest:
+        selftest()
+        return
 
     from run_guest_sptm import Symbols
     from aura.proxy import AuraProxy, UartInterface
@@ -169,7 +209,7 @@ def main():
     bootstrap_port(iface, p)
     sym = Symbols(args.nm, args.elf, p.get_base())
     if args.hist:
-        write_hist(iface, p, sym, args.hist)
+        write_pkts(iface, p, sym, args.hist)
         if args.hist_only:
             return
     lookup = None if args.no_names else ProxyUtils(p).adt.build_addr_lookup()

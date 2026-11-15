@@ -8,6 +8,7 @@
 #include "s2r_dcp_pkt.h"
 #include "adt.h"
 #include "dart.h"
+#include "heapblock.h"
 #include "malloc.h"
 #include "sptm_virt_priv.h"
 #include "string.h"
@@ -49,14 +50,16 @@
 #define S2R_BIG_NOSLOT 15
 #define S2R_BIG_FROM  ALIGN_UP(12 + S2R_PKT_MAX, 8)
 #define S2R_BIG_CHURN 200
+#define S2R_OUT_TAGS  32 /* per DCP: tags the output cap tracks; more tags stay at the 64-byte limit */
 /*
  * The churn limit hides the words that change on every call, which is where a time stamp sits. So the first
  * S2R_DENSE_LEN calls of every S2R_DENSE_PERIOD calls record every changed word again, churn or not, and the
  * first call of a window records every non-zero word. A window is self-contained: a reader forward-fills from
- * its first call. 128 of 2048 keeps swap_submit (503 busy words) near 64 k records per window.
+ * its first call. 128 of 2048 keeps swap_submit (503 busy words) near 64 k records per window. Off (0) in
+ * this build: the packet ring supersedes the dense windows; the EDR words below keep recording at every change.
  */
 #define S2R_DENSE_PERIOD 2048
-#define S2R_DENSE_LEN    128
+#define S2R_DENSE_LEN    0
 /*
  * The EDR fields of a swap_submit (bl_flags 0x358, bl_limit 0x376, edr_scale 0x37e, edr_headroom 0x3e6) ramp over
  * about 2 s, hundreds of swaps, so the churn limit would cut them. Their words are recorded at every change, window
@@ -84,6 +87,10 @@ static struct s2r_dcp {
     u64 open[2][S2R_DCP_OPEN]; /* outstanding packets per direction, for their replies */
     u8 octx[2][S2R_DCP_OPEN];  /* the context of each, see s2r_dcp_ctx() */
     int nopen[2];
+    struct s2r_out_tag {
+        u32 tag, calls;
+    } out[S2R_OUT_TAGS];
+    u8 nout;  /* tags in out[] */
     u8 busy; /* one core at a time; a contended access is not followed */
 } s2r_dcp[S2R_DCP_N];
 struct s2r_big {
@@ -94,7 +101,7 @@ struct s2r_big {
 };
 /* From the heap: the image has no .bss room before the DCP __OS_LOG buffer that sits behind it. */
 static struct s2r_big *s2r_big[S2R_DCP_N];
-struct s2r_hist *sptm_virt_s2r_hist[S2R_DCP_N];
+struct s2r_pkt_ring *sptm_virt_s2r_hist[S2R_DCP_N];
 static u8 s2r_nbig[S2R_DCP_N];
 static int s2r_n_dcp;
 u32 sptm_virt_s2r_dcp_pkt; /* host: copy the DCPs' IOMFB packets into the ring */
@@ -190,12 +197,14 @@ static void s2r_dcp_big(int idx, struct s2r_dcp *d, u64 off, u64 h0, u64 h1, u64
     if (slot < 0)
         return;
     struct s2r_big *b = &s2r_big[idx][slot];
-    struct s2r_hist *hs = in >= S2R_HIST_MIN && 12 + in <= S2R_BIG_WORDS * 8UL ? sptm_virt_s2r_hist[idx] : NULL;
+    struct s2r_pkt_ring *hs = in >= S2R_HIST_MIN && 12 + in <= S2R_PKT_WORDS * 8UL ? sptm_virt_s2r_hist[idx] : NULL;
+    struct s2r_pkt_entry *pe = NULL;
     u64 *hw = NULL;
     if (hs) {
-        hs->n++;
-        hs->call[(hs->n - 1) % S2R_HIST_N] = 0;
-        hw = hs->w[(hs->n - 1) % S2R_HIST_N];
+        pe = &hs->e[hs->n++ % hs->nent];
+        pe->call = 0; /* a peek failure below leaves the entry out */
+        pe->tick = mrs(CNTPCT_EL0);
+        hw = pe->w;
         hw[0] = h0;
         hw[1] = h1;
     }
@@ -220,8 +229,24 @@ static void s2r_dcp_big(int idx, struct s2r_dcp *d, u64 off, u64 h0, u64 h1, u64
         if (++b->churn[w] == S2R_BIG_CHURN)
             s2r_pkt_rec(idx, 6, slot << 12 | w, pa, S2R_BIG_CHURN, a2i);
     }
-    if (hs)
-        hs->call[(hs->n - 1) % S2R_HIST_N] = hs->n;
+    if (pe)
+        pe->call = hs->n;
+}
+
+/* The kind-2 output cap: the first 16 calls of a tag per DCP copy S2R_OUT_MAX bytes, later calls
+ * S2R_BIG_OUT. The table is linear, 32 tags; a tag beyond them stays at the 64-byte limit. */
+static u64 s2r_out_cap(int idx, u32 tag)
+{
+    struct s2r_dcp *d = &s2r_dcp[idx];
+    for (int i = 0; i < d->nout; i++)
+        if (d->out[i].tag == tag)
+            return d->out[i].calls++ < 16 ? S2R_OUT_MAX : S2R_BIG_OUT;
+    if (d->nout == S2R_OUT_TAGS)
+        return S2R_BIG_OUT;
+    d->out[d->nout].tag = tag;
+    d->out[d->nout].calls = 1;
+    d->nout++;
+    return S2R_OUT_MAX;
 }
 
 /* kind 0: an AP call, 1: a DCP callback, 2: an AP call's output, 3: a callback's output */
@@ -237,7 +262,9 @@ static void s2r_dcp_copy(int idx, struct s2r_dcp *d, u64 off, int kind, bool a2i
     if (big)
         s2r_dcp_big(idx, d, off, h0, h1, pa0, a2i);
     u64 from = kind < 2 ? off + 16 : ALIGN_DOWN(off + 12 + min(in, (u64)S2R_DCP_RPC), 8);
-    u64 outmax = kind == 2 && in >= S2R_BIG_MIN ? (u64)S2R_BIG_OUT : (u64)S2R_OUT_MAX;
+    /* The A492 answers made 43% of the pass 9 ring records (2212 calls x 514 records) and their full
+     * answers are needed once; every tag's first 16 outputs go whole, the rest at 64 bytes. */
+    u64 outmax = kind == 2 ? s2r_out_cap(idx, (u32)h0) : (u64)S2R_OUT_MAX;
     u64 to = kind < 2 ? off + 12 + min(in, big ? (u64)S2R_PKT_MAX : (u64)S2R_IN_MAX)
                       : from + min(out + 8, outmax);
     for (u64 o = from, w = 2; o < to && o + 8 <= S2R_DCP_RPC; o += 8, w++) {
@@ -344,6 +371,33 @@ static void s2r_dcp_watch_one(int i, u64 off, const u64 *val, int width)
     }
 }
 
+/* The packet ring of one DCP: try capacities in descending order so a tight heap degrades instead of
+ * failing. The heap is a non-freeing bump of 128 MiB that PANICS past its limit (heapblock_alloc_aligned,
+ * via dlmalloc's sbrk), so measure the room first and never ask for more; the 0x1000 margin covers
+ * dlmalloc's own chunk overhead. The main 64 MiB ring is allocated before this runs: s2r_dcp_add is
+ * called from s2r_t6050_coproc, which sptm_virt_s2r_setup reaches only after its ring memalign, so the
+ * ring keeps its size and this only fills what is left. A DCP with no room runs without a ring. */
+static void s2r_pkt_ring_alloc(int idx)
+{
+    static const u32 try_ents[] = {11000, 8000, 5000, 1000, 3};
+    size_t hdr = sizeof(struct s2r_pkt_ring), ent = sizeof(struct s2r_pkt_entry);
+    uintptr_t limit = heapblock_limit();
+
+    for (unsigned i = 0; i < ARRAY_SIZE(try_ents); i++) {
+        size_t bytes = hdr + (size_t)try_ents[i] * ent;
+        uintptr_t here = (heapblock_high_water() + 63) & ~63UL; /* the bump's next allocation starts here */
+        if (limit && here + bytes + 0x1000 > limit)
+            continue;
+        sptm_virt_s2r_hist[idx] = calloc(1, bytes);
+        if (sptm_virt_s2r_hist[idx]) {
+            printf("SPTM-virt[s2r]: packet ring %u entries, %lu MiB (%lu bytes each), dcp %d\n",
+                   try_ents[i], bytes >> 20, (u64)ent, idx);
+            return;
+        }
+    }
+    printf("SPTM-virt[s2r]: packet ring none for dcp %d (heap short)\n", idx);
+}
+
 /* A DCP or DCPEXT and its mailbox page: its DART is /arm-io/dart-<name>. */
 void s2r_dcp_add(const char *name, u64 mbox)
 {
@@ -358,7 +412,7 @@ void s2r_dcp_add(const char *name, u64 mbox)
         return;
     s2r_dcp[s2r_n_dcp] = (struct s2r_dcp){.mbox = mbox, .dart = base, .dart_size = size};
     s2r_big[s2r_n_dcp] = calloc(S2R_BIG_SLOTS, sizeof(struct s2r_big));
-    sptm_virt_s2r_hist[s2r_n_dcp] = calloc(1, sizeof(struct s2r_hist));
+    s2r_pkt_ring_alloc(s2r_n_dcp);
     printf("SPTM-virt[s2r]: dcp-pkt %d %s mbox 0x%lx dart 0x%lx\n", s2r_n_dcp, name, mbox, base);
     s2r_n_dcp++;
 }
