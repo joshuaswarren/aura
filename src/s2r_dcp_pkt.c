@@ -374,22 +374,28 @@ static void s2r_dcp_watch_one(int i, u64 off, const u64 *val, int width)
 /* The packet ring of one DCP: try capacities in descending order so a tight heap degrades instead of
  * failing. The heap is a non-freeing bump of 128 MiB that PANICS past its limit (heapblock_alloc_aligned,
  * via dlmalloc's sbrk), so measure the room first and never ask for more; the 0x1000 margin covers
- * dlmalloc's own chunk overhead. The main 64 MiB ring is allocated before this runs: s2r_dcp_add is
- * called from s2r_t6050_coproc, which sptm_virt_s2r_setup reaches only after its ring memalign, so the
- * ring keeps its size and this only fills what is left. A DCP with no room runs without a ring. */
+ * dlmalloc's own chunk overhead and S2R_PKT_HEAP_KEEP stays free for whatever allocates after this. The main
+ * 64 MiB ring is allocated before this runs: s2r_dcp_add is called from s2r_t6050_coproc, which
+ * sptm_virt_s2r_setup reaches only after its ring memalign, so the ring keeps its size and this only fills
+ * what is left. Only DCP 0 (the built-in panel) gets a large ring; the others take 3 entries. */
+#define S2R_PKT_HEAP_KEEP (8UL << 20)
 static void s2r_pkt_ring_alloc(int idx)
 {
     static const u32 try_ents[] = {11000, 8000, 5000, 1000, 3};
     size_t hdr = sizeof(struct s2r_pkt_ring), ent = sizeof(struct s2r_pkt_entry);
     uintptr_t limit = heapblock_limit();
 
-    for (unsigned i = 0; i < ARRAY_SIZE(try_ents); i++) {
+    for (unsigned i = idx ? ARRAY_SIZE(try_ents) - 1 : 0; i < ARRAY_SIZE(try_ents); i++) {
         size_t bytes = hdr + (size_t)try_ents[i] * ent;
         uintptr_t here = (heapblock_high_water() + 63) & ~63UL; /* the bump's next allocation starts here */
-        if (limit && here + bytes + 0x1000 > limit)
+        if (limit && here + bytes + 0x1000 + (try_ents[i] > 3 ? S2R_PKT_HEAP_KEEP : 0) > limit)
             continue;
-        sptm_virt_s2r_hist[idx] = calloc(1, bytes);
-        if (sptm_virt_s2r_hist[idx]) {
+        struct s2r_pkt_ring *r = calloc(1, bytes);
+        if (r) {
+            r->magic = S2R_PKT_RING_MAGIC;
+            r->nent = try_ents[i];
+            r->entry_bytes = ent;
+            sptm_virt_s2r_hist[idx] = r;
             printf("SPTM-virt[s2r]: packet ring %u entries, %lu MiB (%lu bytes each), dcp %d\n",
                    try_ents[i], bytes >> 20, (u64)ent, idx);
             return;
