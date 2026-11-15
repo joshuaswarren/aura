@@ -335,6 +335,18 @@ static int storage_find(void)
     return 0;
 }
 
+/* A storage PS register may move its actual state and was-gated flags (bits 9:4). With auto-PM on
+ * and the target unchanged, the hardware also gates an idle domain and rewrites PS_AUTO (27:24):
+ * iBoot leaves APCIE_SYS_ST0 so. Nothing else may move. */
+static bool storage_ps_moved_ok(u32 ref, u32 cur)
+{
+    u32 free = 0x3f0;
+
+    if ((ref & BIT(28)) && (cur & BIT(28)) && !((ref ^ cur) & 0xf))
+        free |= GENMASK(27, 24);
+    return !((cur ^ ref) & ~free);
+}
+
 static int storage_check(const char *tag, bool reference)
 {
     u32 cur[ST_COUNT];
@@ -350,8 +362,8 @@ static int storage_check(const char *tag, bool reference)
         printf("pcie-t6050: storage %s: 0x%lx 0x%08x -> 0x%08x\n", tag, storage_addr[i],
                storage_ref[i], cur[i]);
         changed++;
-        /* PS actual state and was-gated flags may move; target and auto must not */
-        if (i >= ST_PS && i < ST_SART && !((cur[i] ^ storage_ref[i]) & ~0x3f0))
+        /* PS bits the hardware moves may change; target and the rest must not */
+        if (i >= ST_PS && i < ST_SART && storage_ps_moved_ok(storage_ref[i], cur[i]))
             continue;
         if (i >= ST_PS || i == ST_BOOT_STATUS || i == ST_CC)
             FAIL("storage changed %s\n", tag);
