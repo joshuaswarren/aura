@@ -387,6 +387,20 @@ int main(void)
     a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
     CHECK(find(4, 1) && count_kind(5) == 0, "first tag again after the second: %d changed words", count_kind(5));
 
+    /* The EDR fields (file offsets 0x358 to 0x3f0) change on every swap of a ramp, far past the churn limit,
+     * so their words are recorded at every change, window or not. Word 124 (0x3e0) is one of them. */
+    int watched = 0;
+    for (int i = 0; i < 300; i++) {
+        *(u64 *)pg_pa(CALL_OFF + 992) = 0xe000 + i;
+        nrec = 0;
+        a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
+        watched += count_kind(5) == 1 && find(5, 1 << 12 | 124) && find(5, 1 << 12 | 124)->val == 0xe000 + i;
+    }
+    CHECK(watched == 300, "an EDR word recorded at %d of 300 changes", watched);
+    CHECK(count_kind(6) == 0, "an EDR word is never marked volatile");
+    *(u64 *)pg_pa(CALL_OFF + 992) = 0x5000 + 124;
+    a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
+
     /* A DCP that runs out of slots records the call's summary only. */
     for (int n = 0; n < 4; n++) {
         *(u64 *)pg_pa(CALL_OFF) = (0x300UL << 32) | (0x10000 + n);

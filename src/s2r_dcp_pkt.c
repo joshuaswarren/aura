@@ -57,6 +57,21 @@
  */
 #define S2R_DENSE_PERIOD 2048
 #define S2R_DENSE_LEN    128
+/*
+ * The EDR fields of a swap_submit (bl_flags 0x358, bl_limit 0x376, edr_scale 0x37e, edr_headroom 0x3e6) ramp over
+ * about 2 s, hundreds of swaps, so the churn limit would cut them. Their words are recorded at every change, window
+ * or not. The byte offsets are taken from the packet payload (file offset = payload + 12) and from the packet start,
+ * since the base is not known: the words that hold each field at either base, as indexes from the packet start.
+ */
+static const u16 s2r_edr_words[] = {0x6b, 0x6c, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x7c, 0x7e};
+
+static bool s2r_edr_word(u64 w)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(s2r_edr_words); i++)
+        if (s2r_edr_words[i] == w)
+            return true;
+    return false;
+}
 
 static struct s2r_dcp {
     u64 mbox, dart, dart_size;
@@ -195,7 +210,7 @@ static void s2r_dcp_big(int idx, struct s2r_dcp *d, u64 off, u64 h0, u64 h1, u64
         if (v == b->prev[w] && !(dense && first && v))
             continue;
         b->prev[w] = v;
-        if (dense) {
+        if (dense || s2r_edr_word(w)) {
             s2r_pkt_rec(idx, 5, slot << 12 | w, pa, v, a2i);
             continue;
         }
