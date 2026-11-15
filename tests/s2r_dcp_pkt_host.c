@@ -313,6 +313,10 @@ int main(void)
     nrec = 0;
     a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
     CHECK(count_kind(4) == 1 && count_kind(5) == 0, "same call again: %d changed words", count_kind(5));
+    for (int c = 2; c < 128; c++) { /* idle calls to the end of the first window, so the churn limit is tested alone */
+        nrec = 0;
+        a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
+    }
 
     /* One word moves (the brightness): exactly that word is recorded, then it stops at the churn limit. */
     int sent = 0, volatile_at = 0;
@@ -327,22 +331,45 @@ int main(void)
         if (count_kind(6) && !volatile_at)
             volatile_at = i + 1;
     }
-    CHECK(sent == 199, "word 100 recorded %d more times, want 199 (200 in all)", sent);
-    CHECK(volatile_at == 199, "word 100 marked volatile at change %d, want 199", volatile_at);
+    CHECK(sent == 200, "word 100 recorded %d times outside a window, want 200", sent);
+    CHECK(volatile_at == 200, "word 100 marked volatile at change %d, want 200", volatile_at);
 
-    /* The last three large calls are kept whole, volatile words too: 250 calls moved word 100 and
+    /* The last three large calls are kept whole, volatile words too: the calls moved word 100 and
      * the ring has stopped recording it, but the last three values are still readable. */
     struct hist *h = sptm_virt_s2r_hist[0];
-    CHECK(h && h->n == 252, "history: %lu calls, want 252", h ? (unsigned long)h->n : 0UL);
+    CHECK(h && h->n == 378, "history: %lu calls, want 378", h ? (unsigned long)h->n : 0UL);
     for (int k = 0; h && k < 3; k++) {
-        int at = (252 - 2 + k - 1) % 3; /* call number c sits at (c - 1) % 3 */
-        CHECK(h->call[at] == 250 + k, "history: slot %d holds call %lu, want %d", at, (unsigned long)h->call[at], 250 + k);
-        CHECK(h->w[at][0] == ((0x1144UL << 32) | 0x38353441), "history: call %d head 0x%lx", 250 + k, (unsigned long)h->w[at][0]);
-        CHECK(h->w[at][100] == 0x9000 + 247 + k, "history: call %d word 100 is 0x%lx, want 0x%x", 250 + k,
+        int at = (375 + k) % 3; /* call number c sits at (c - 1) % 3 */
+        CHECK(h->call[at] == 376 + k, "history: slot %d holds call %lu, want %d", at, (unsigned long)h->call[at], 376 + k);
+        CHECK(h->w[at][0] == ((0x1144UL << 32) | 0x38353441), "history: call %d head 0x%lx", 376 + k, (unsigned long)h->w[at][0]);
+        CHECK(h->w[at][100] == 0x9000 + 247 + k, "history: call %d word 100 is 0x%lx, want 0x%x", 376 + k,
               (unsigned long)h->w[at][100], 0x9000 + 247 + k);
-        CHECK(h->w[at][2] == 0x5002 && h->w[at][553] == 0x5000 + 553, "history: call %d words 2 and 553: 0x%lx 0x%lx", 250 + k,
+        CHECK(h->w[at][2] == 0x5002 && h->w[at][553] == 0x5000 + 553, "history: call %d words 2 and 553: 0x%lx 0x%lx", 376 + k,
               (unsigned long)h->w[at][2], (unsigned long)h->w[at][553]);
     }
+
+    /* The limit hides a busy word, so every 2048th call opens a 128-call window that records changes again. */
+    for (int c = 2 + 126 + 250; c < 2048; c++) { /* idle calls up to the next window */
+        nrec = 0;
+        a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
+        CHECK(count_kind(5) == 0, "idle call %d recorded %d words", c, count_kind(5));
+    }
+    *(u64 *)pg_pa(CALL_OFF + 800) = 0xa000;
+    nrec = 0;
+    a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
+    CHECK(count_kind(5) == 552, "window start: %d words, want all 552 non-zero words", count_kind(5));
+    for (int i = 1; i < 128; i++) {
+        *(u64 *)pg_pa(CALL_OFF + 800) = 0xa000 + i;
+        nrec = 0;
+        a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
+        CHECK(count_kind(5) == 1 && find(5, 1 << 12 | 100) && find(5, 1 << 12 | 100)->val == 0xa000 + i,
+              "window call %d: %d records for the busy word", i, count_kind(5));
+    }
+    *(u64 *)pg_pa(CALL_OFF + 800) = 0xb000;
+    nrec = 0;
+    a2i(((CALL_OFF & 0xffff) << 16) | 0x302, 0x37);
+    CHECK(count_kind(5) == 0, "after the window the busy word is silent again: %d records", count_kind(5));
+
 
     /* A second large call (a color table) has its own baseline: neither call records the other's words. */
     *(u64 *)pg_pa(CALL_OFF) = (0x600UL << 32) | 0x3054554c; /* "LUT0" */

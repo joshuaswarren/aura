@@ -49,6 +49,14 @@
 #define S2R_BIG_NOSLOT 15
 #define S2R_BIG_FROM  ALIGN_UP(12 + S2R_PKT_MAX, 8)
 #define S2R_BIG_CHURN 200
+/*
+ * The churn limit hides the words that change on every call, which is where a time stamp sits. So the first
+ * S2R_DENSE_LEN calls of every S2R_DENSE_PERIOD calls record every changed word again, churn or not, and the
+ * first call of a window records every non-zero word. A window is self-contained: a reader forward-fills from
+ * its first call. 128 of 2048 keeps swap_submit (503 busy words) near 64 k records per window.
+ */
+#define S2R_DENSE_PERIOD 2048
+#define S2R_DENSE_LEN    128
 
 static struct s2r_dcp {
     u64 mbox, dart, dart_size;
@@ -65,6 +73,7 @@ static struct s2r_dcp {
 } s2r_dcp[S2R_DCP_N];
 struct s2r_big {
     u32 tag;
+    u32 calls; /* calls of this tag seen, for the dense windows */
     u64 prev[S2R_BIG_WORDS]; /* the last value seen; 0 before the first call */
     u8 churn[S2R_BIG_WORDS];
 };
@@ -175,15 +184,21 @@ static void s2r_dcp_big(int idx, struct s2r_dcp *d, u64 off, u64 h0, u64 h1, u64
         hw[0] = h0;
         hw[1] = h1;
     }
+    u32 pos = b->calls++ % S2R_DENSE_PERIOD;
+    bool dense = pos < S2R_DENSE_LEN, first = pos == 0;
     for (u64 o = off + S2R_BIG_FROM; o < end && o + 8 <= S2R_DCP_RPC; o += 8) {
         u64 v, w = (o - off) / 8, pa = s2r_dcp_pa(d, o);
         if (!pa || !sptm_virt_peek64(pa, &v))
             return;
         if (hw)
             hw[w] = v;
-        if (v == b->prev[w])
+        if (v == b->prev[w] && !(dense && first && v))
             continue;
         b->prev[w] = v;
+        if (dense) {
+            s2r_pkt_rec(idx, 5, slot << 12 | w, pa, v, a2i);
+            continue;
+        }
         if (b->churn[w] >= S2R_BIG_CHURN)
             continue;
         s2r_pkt_rec(idx, 5, slot << 12 | w, pa, v, a2i);
