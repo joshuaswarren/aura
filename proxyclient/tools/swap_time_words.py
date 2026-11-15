@@ -40,8 +40,8 @@ def parse(lines, tag, dcp=0):
     return ticks, changes
 
 
-def windows(n, period, length):
-    return [(s, min(s + length, n)) for s in range(0, n, period)]
+def windows(n, period, length, phase=0):
+    return [(s, min(s + length, n)) for s in range(phase, n, period)]
 
 
 def u32(words, off):
@@ -103,9 +103,9 @@ def analyse_window(ticks, changes, lo, hi):
     return rows
 
 
-def report(ticks, changes, period, length, out=print):
+def report(ticks, changes, period, length, out=print, phase=0):
     found = 0
-    for lo, hi in windows(len(ticks), period, length):
+    for lo, hi in windows(len(ticks), period, length, phase):
         if hi - lo < 16:
             continue
         rows = analyse_window(ticks, changes, lo, hi)
@@ -159,11 +159,16 @@ if __name__ == "__main__":
     opt = lambda name, d: type(d)(args[args.index(name) + 1]) if name in args else d
     path = args[0]
     tag, period, length = opt("--tag", "194A"), opt("--period", 2048), opt("--len", 128)
+    # a ring that wrapped lost the oldest calls, so window starts are not multiples of the period: --phase -1 = first call with 100+ changed words
+    phase = opt("--phase", -1)
     op = gzip.open if path.endswith(".gz") else open
     with op(path, "rt", errors="replace") as f:
         ticks, changes = parse(f, tag)
     if not ticks:
         sys.exit(f"no big-call records with tag {tag} on dcp0 in {path}")
     print(f"{len(ticks)} swap_submit calls, tag {tag}")
-    if not report(ticks, changes, period, length):
+    if phase < 0:
+        phase = next((i for i, c in enumerate(changes) if len(c) >= 100), 0) % period
+    print(f"windows start at surviving call {phase}, then every {period}")
+    if not report(ticks, changes, period, length, phase=phase):
         sys.exit("no window holds a time word")
