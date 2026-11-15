@@ -3232,8 +3232,8 @@ static bool dcp6_dt_describes(void *dt)
  * The image is pinned because 27.0 and 27.0.1 report the same iBoot version.
  */
 #define T6050_DCP_UUID  "64863924-B56B-3E32-87FE-038677F52709"
-/* 27.3 (26C5035r, M5 Max K114c): iBoot "mBoot-20457.60.65.0.1", a different DCP image, same
- * interface as the 27.0 the kernel is written for: the device tree says 27.0, the ADT's image id */
+/* 27.3 (26C5035r, M5 Max K114c): iBoot "mBoot-20457.60.65.0.1", a different DCP image. It keeps
+ * the 27.0 interface but numbers its IOMFB methods differently, so the device tree says 27.3 */
 #define T6050_DCP_UUID_27_3 "58CB3FFC-B2BA-352E-B20B-71A91B15FA9F"
 #define T6050_IBOOT_27_3    "mBoot-20457.60.65.0.1"
 static struct fw_version_info t6050_fw;
@@ -3321,8 +3321,8 @@ static T6050_INIT int t6050_check_adt(void)
     t6050_fw = os_firmware;
     if (fw27_3) {
         t6050_fw.version = V27_0;
-        t6050_fw.string = "27.0";
-        t6050_fw.num[0] = 27, t6050_fw.num[1] = 0, t6050_fw.num[2] = 0;
+        t6050_fw.string = "27.3";
+        t6050_fw.num[0] = 27, t6050_fw.num[1] = 3, t6050_fw.num[2] = 0;
         t6050_fw.num_length = 3;
     }
     if (!dcp6_is_uuid(uuid, len) || strcmp(uuid, t6050_uuid))
